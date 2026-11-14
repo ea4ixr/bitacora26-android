@@ -41,7 +41,7 @@ import java.util.TimeZone;
  */
 public class MainActivity extends Activity {
 
-    static final String VERSION = "0.1";
+    static final String VERSION = "0.2";
 
     // Colores (los mismos que las pantallas de ejemplo)
     static final int FONDO = Color.rgb(20, 32, 51), TARJETA = Color.rgb(29, 43, 66), BORDE = Color.rgb(51, 68, 92),
@@ -53,6 +53,11 @@ public class MainActivity extends Activity {
 
     private Db db;
     private SharedPreferences prefs;
+    private Nube nube;
+    private Qrz qrz;
+    private final java.util.concurrent.ExecutorService fondo = java.util.concurrent.Executors.newSingleThreadExecutor();
+    private final android.os.Handler ui = new android.os.Handler(android.os.Looper.getMainLooper());
+    private volatile String estadoSync = "";
     private LinearLayout contenido, barra;
     private String pantalla = "INICIO";
 
@@ -65,6 +70,8 @@ public class MainActivity extends Activity {
         super.onCreate(b);
         db = new Db(this);
         prefs = getSharedPreferences("bitacora26", MODE_PRIVATE);
+        nube = new Nube(prefs, db);
+        qrz = new Qrz(prefs);
         bandaSel = prefs.getString("banda", "40m");
         modoSel = prefs.getString("modo", "SSB");
 
@@ -87,6 +94,40 @@ public class MainActivity extends Activity {
 
         if (operador().isEmpty()) pedirIndicativo(true);
         mostrar("INICIO");
+        sincronizar(false);
+    }
+
+    @Override protected void onResume() {
+        super.onResume();
+        if (nube != null && nube.conectada() && System.currentTimeMillis() - prefs.getLong("ultimaSync", 0) > 60_000) sincronizar(false);
+    }
+
+    /** Manda y recoge del buzón, en segundo plano. Con «avisar», dice el resultado aunque no haya nada. */
+    void sincronizar(boolean avisar) {
+        if (!nube.conectada()) {
+            if (avisar) Toast.makeText(this, "Conecta antes tu cuenta de Bitácora 26 (Ajustes)", Toast.LENGTH_LONG).show();
+            return;
+        }
+        estadoSync = "Sincronizando…";
+        fondo.execute(() -> {
+            String msg;
+            boolean cambios = false;
+            try {
+                int[] r = nube.sincronizar(operador());
+                cambios = r[1] > 0;
+                String h = new SimpleDateFormat("HH:mm", Locale.ROOT).format(new Date());
+                msg = "Sincronizado " + h + (r[0] > 0 ? " · enviados " + r[0] : "") + (r[1] > 0 ? " · recibidos " + r[1] : "");
+            } catch (Exception e) {
+                msg = "Sin sincronizar: " + e.getMessage();
+            }
+            String fm = msg;
+            boolean refrescar = cambios;
+            ui.post(() -> {
+                estadoSync = fm;
+                if (avisar) Toast.makeText(this, fm, Toast.LENGTH_SHORT).show();
+                if (refrescar || "INICIO".equals(pantalla)) mostrar(pantalla);
+            });
+        });
     }
 
     @Override public void onBackPressed() {
@@ -288,6 +329,20 @@ public class MainActivity extends Activity {
             contenido.addView(t, separado(14));
         }
 
+        if (nube.conectada()) {
+            int pend = db.numPendientes();
+            TextView sy = texto((estadoSync.isEmpty() ? "Conectado con tu cuenta" : estadoSync)
+                    + (pend > 0 ? " · " + pend + " sin enviar" : "") + "  ·  Toca para sincronizar", 12, pend > 0 ? NARANJA : VERDE, false);
+            sy.setPadding(0, dp(12), 0, 0);
+            sy.setOnClickListener(v -> sincronizar(true));
+            contenido.addView(sy);
+        } else {
+            TextView sy = texto("Sin conectar con el PC · Ajustes → Conectar mi cuenta de Bitácora 26", 12, GRIS, false);
+            sy.setPadding(0, dp(12), 0, 0);
+            sy.setOnClickListener(v -> conectarCuenta());
+            contenido.addView(sy);
+        }
+
         contenido.addView(rotulo("ÚLTIMOS CONTACTOS"));
         List<Db.Qso> ult = db.qsos("TODOS", "", 0, 5, hoy);
         if (ult.isEmpty()) contenido.addView(texto("Todavía no hay contactos. Pulsa «Apuntar contacto».", 14, GRIS, false));
@@ -318,13 +373,45 @@ public class MainActivity extends Activity {
         contenido.addView(aviso);
 
         EditText nombre = campo("Nombre", false, 16), qth = campo("QTH (ciudad)", false, 16), grid = campo("Locator", false, 16);
+        Button verQrz = boton("Ver en QRZ.com", TARJETA, NARANJA);
+        verQrz.setTextSize(14);
+        verQrz.setBackground(fondo(TARJETA, NARANJA, 10));
+        verQrz.setVisibility(View.GONE);
+        final String[] qrzDe = {""};
+        verQrz.setOnClickListener(v -> abrirQrz(qrzDe[0]));
+        final Runnable[] buscarQrz = new Runnable[1];
+        buscarQrz[0] = () -> {
+            String i = ind.getText().toString().trim().toUpperCase(Locale.ROOT);
+            if (i.length() < 3 || "CB".equals(bandaSel) || !qrz.configurado()) { verQrz.setVisibility(View.GONE); return; }
+            boolean faltan = nombre.getText().length() == 0 || qth.getText().length() == 0 || grid.getText().length() == 0;
+            fondo.execute(() -> {
+                String[] d = qrz.buscar(i);
+                ui.post(() -> {
+                    if (!i.equals(ind.getText().toString().trim().toUpperCase(Locale.ROOT))) return;   // ya ha escrito otro
+                    if (d == null || "CB".equals(bandaSel)) { verQrz.setVisibility(View.GONE); return; }
+                    qrzDe[0] = i;
+                    verQrz.setText("Ver " + i + " en QRZ.com");
+                    verQrz.setVisibility(View.VISIBLE);
+                    // Solo se rellena lo que falta (primero van los datos propios)
+                    if (faltan) {
+                        if (nombre.getText().length() == 0 && !d[0].isEmpty()) nombre.setText(d[0].toUpperCase(Locale.ROOT));
+                        if (qth.getText().length() == 0 && !d[1].isEmpty()) qth.setText(d[1].toUpperCase(Locale.ROOT));
+                        if (grid.getText().length() == 0 && !d[2].isEmpty()) grid.setText(d[2].toUpperCase(Locale.ROOT));
+                    }
+                });
+            });
+        };
+        final Runnable esperaQrz = () -> buscarQrz[0].run();
 
         ind.addTextChangedListener(new TextWatcher() {
             public void beforeTextChanged(CharSequence s, int a, int b, int c) { }
             public void onTextChanged(CharSequence s, int a, int b, int c) { }
             public void afterTextChanged(Editable s) {
                 String i = s.toString().trim();
+                ui.removeCallbacks(esperaQrz);
+                verQrz.setVisibility(View.GONE);
                 if (i.length() < 3) { aviso.setText(""); return; }
+                ui.postDelayed(esperaQrz, 900);   // se busca en QRZ.com cuando deja de escribir
                 String ya = db.yaTrabajado(i);
                 aviso.setText(ya.isEmpty() ? "Nuevo: no lo tienes en el LOG" : "Ya trabajado: " + ya);
                 aviso.setTextColor(ya.isEmpty() ? VERDE : NARANJA);
@@ -348,7 +435,7 @@ public class MainActivity extends Activity {
         Runnable[] repintar = new Runnable[1];
         repintar[0] = () -> {
             cajaBanda.removeAllViews();
-            cajaBanda.addView(fichas(BANDAS, bandaSel, x -> { bandaSel = x; repintar[0].run(); }));
+            cajaBanda.addView(fichas(BANDAS, bandaSel, x -> { bandaSel = x; repintar[0].run(); buscarQrz[0].run(); }));
             cajaModo.removeAllViews();
             cajaModo.addView(fichas(MODOS, modoSel, x -> { modoSel = x; repintar[0].run(); }));
         };
@@ -368,6 +455,7 @@ public class MainActivity extends Activity {
         rst.addView(c2, new LinearLayout.LayoutParams(0, -2, 1));
         contenido.addView(rst);
 
+        contenido.addView(verQrz, separado(10));
         contenido.addView(rotulo("NOMBRE · QTH · LOCATOR"));
         contenido.addView(nombre);
         contenido.addView(qth, separado(8));
@@ -402,7 +490,9 @@ public class MainActivity extends Activity {
             q.comentario = coment.getText().toString().trim().toUpperCase(Locale.ROOT);
             q.operador = operador();
             if (nomAct != null) { q.actividadNumeral = act; q.actividad = nomAct; }
-            db.guardar(q);
+            String uuid = db.guardar(q);
+            nube.encolarQso(q, uuid, operador());
+            sincronizar(false);
             prefs.edit().putString("banda", bandaSel).putString("modo", modoSel).apply();
             Toast.makeText(this, "Guardado: " + i + " · " + q.hora + " UTC", Toast.LENGTH_SHORT).show();
             mostrar("CONTACTO");   // formulario limpio para el siguiente
@@ -508,12 +598,23 @@ public class MainActivity extends Activity {
             fila.addView(der);
             if (borrable) {
                 fila.setOnLongClickListener(v -> {
-                    new AlertDialog.Builder(this)
-                            .setTitle("Borrar contacto")
-                            .setMessage("¿Borrar el contacto con " + q.indicativo + " (" + q.fecha + " " + q.hora + " UTC)?")
-                            .setPositiveButton("Borrar", (d, w) -> { db.borrar(q.id); mostrar("LOG"); })
-                            .setNegativeButton("Cancelar", null)
-                            .show();
+                    boolean cb = "CB".equals(q.banda);
+                    String[] ops = cb ? new String[]{"Borrar contacto"} : new String[]{"Ver " + q.indicativo + " en QRZ.com", "Borrar contacto"};
+                    new AlertDialog.Builder(this).setTitle(q.indicativo).setItems(ops, (dd, w) -> {
+                        if (!cb && w == 0) { abrirQrz(q.indicativo); return; }
+                        new AlertDialog.Builder(this)
+                                .setTitle("Borrar contacto")
+                                .setMessage("¿Borrar el contacto con " + q.indicativo + " (" + q.fecha + " " + q.hora + " UTC)?"
+                                        + (nube.conectada() ? "\n\nTambién se borrará en tu PC." : ""))
+                                .setPositiveButton("Borrar", (d, ww) -> {
+                                    db.borrar(q.id);
+                                    nube.encolarQso(null, q.uuid, operador());
+                                    sincronizar(false);
+                                    mostrar("LOG");
+                                })
+                                .setNegativeButton("Cancelar", null)
+                                .show();
+                    }).show();
                     return true;
                 });
             }
@@ -565,6 +666,7 @@ public class MainActivity extends Activity {
                         .setMessage("¿Borrar la actividad «" + a.nombre + "»?\n\nLos contactos NO se borran: se quedan en tu LOG.")
                         .setPositiveButton("Borrar", (d, w) -> {
                             db.borrarActividad(a.numeral);
+                            if (a.uuid != null && !a.uuid.isEmpty()) { nube.encolarActividad(a.uuid, null, operador()); sincronizar(false); }
                             if (prefs.getInt("actividad", 0) == a.numeral) prefs.edit().putInt("actividad", 0).apply();
                             mostrar("ACTIVIDADES");
                         })
@@ -585,7 +687,10 @@ public class MainActivity extends Activity {
                     .setPositiveButton("Crear", (d, w) -> {
                         String n = nombre.getText().toString().trim().toUpperCase(Locale.ROOT);
                         if (n.isEmpty()) return;
-                        int num = db.crearActividad(n);
+                        Object[] na = db.crearActividad(n);
+                        int num = (Integer) na[0];
+                        nube.encolarActividad((String) na[1], n, operador());
+                        sincronizar(false);
                         prefs.edit().putInt("actividad", num).apply();
                         mostrar("ACTIVIDADES");
                     })
@@ -593,7 +698,8 @@ public class MainActivity extends Activity {
                     .show();
         });
         contenido.addView(nueva, separado(16));
-        TextView ayuda = texto("Pulsa una actividad para apuntar en ella. Mantén pulsado para borrarla (sus contactos se quedan en el LOG).", 12, GRIS, false);
+        TextView ayuda = texto("Pulsa una actividad para apuntar en ella. Mantén pulsado para borrarla (sus contactos se quedan en el LOG). "
+                + "Las actividades del radioclub se gestionan en el PC.", 12, GRIS, false);
         ayuda.setPadding(0, dp(10), 0, 0);
         contenido.addView(ayuda);
     }
@@ -620,11 +726,17 @@ public class MainActivity extends Activity {
         String[] ops = {"Cambiar mi indicativo (" + operador() + ")",
                 prefs.getBoolean("verLocal", false) ? "Ver horas en UTC (ahora: hora local)" : "Ver horas en hora local (ahora: UTC)",
                 "Exportar todo el LOG (ADI)",
+                nube.conectada() ? "Cuenta de Bitácora 26: " + nube.cuenta() + " (desconectar)" : "Conectar mi cuenta de Bitácora 26 (sincronizar con el PC)",
+                "Sincronizar ahora con el PC",
+                qrz.configurado() ? "Cuenta de QRZ.com: " + prefs.getString("qrzUsuario", "") : "Cuenta de QRZ.com (para buscar nombre y QTH)",
                 "Acerca de Bitácora 26 móvil"};
         new AlertDialog.Builder(this).setTitle("Ajustes").setItems(ops, (d, w) -> {
             if (w == 0) pedirIndicativo(false);
             else if (w == 1) { prefs.edit().putBoolean("verLocal", !prefs.getBoolean("verLocal", false)).apply(); mostrar(pantalla); }
             else if (w == 2) exportarAdi();
+            else if (w == 3) { if (nube.conectada()) desconectarCuenta(); else conectarCuenta(); }
+            else if (w == 4) sincronizar(true);
+            else if (w == 5) cuentaQrz();
             else new AlertDialog.Builder(this).setTitle("Bitácora 26 móvil " + VERSION)
                         .setMessage("LOG de bolsillo, acompañante de Bitácora 26 para PC.\n\nLa hora se guarda siempre en UTC. "
                                 + "Exporta el LOG en ADI y lo importas en el PC (Archivo → Importar).\n\nbitacora26.es · EA4IXR")
@@ -632,6 +744,112 @@ public class MainActivity extends Activity {
                         .setNeutralButton("Abrir la web", (x, y) -> startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse("https://bitacora26.es"))))
                         .show();
         }).show();
+    }
+
+    private void abrirQrz(String call) {
+        try { startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse("https://www.qrz.com/db/" + Uri.encode(call)))); } catch (Exception ignored) { }
+    }
+
+    private EditText campoClave(String pista) {
+        EditText e = new EditText(this);
+        e.setHint(pista);
+        e.setSingleLine(true);
+        e.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        return e;
+    }
+
+    private LinearLayout caja(View... vs) {
+        LinearLayout l = new LinearLayout(this);
+        l.setOrientation(LinearLayout.VERTICAL);
+        l.setPadding(dp(20), dp(8), dp(20), 0);
+        for (View v : vs) l.addView(v, separado(8));
+        return l;
+    }
+
+    /** Usuario y contraseña de QRZ.com (los escribe el usuario; se guardan solo en este móvil). */
+    private void cuentaQrz() {
+        EditText u = new EditText(this);
+        u.setHint("Usuario de QRZ.com");
+        u.setSingleLine(true);
+        u.setText(prefs.getString("qrzUsuario", ""));
+        EditText c = campoClave("Contraseña de QRZ.com");
+        TextView nota = texto("Hace falta una suscripción de QRZ.com que permita consultas XML (como en el PC). En banda CB nunca se consulta.", 12, Color.GRAY, false);
+        new AlertDialog.Builder(this).setTitle("Cuenta de QRZ.com").setView(caja(u, c, nota))
+                .setPositiveButton("Guardar", (d, w) -> {
+                    String usuario = u.getText().toString().trim(), clave = c.getText().toString();
+                    if (usuario.isEmpty()) { prefs.edit().remove("qrzUsuario").remove("qrzClave").apply(); return; }
+                    SharedPreferences.Editor ed = prefs.edit().putString("qrzUsuario", usuario);
+                    if (!clave.isEmpty()) ed.putString("qrzClave", clave);
+                    ed.apply();
+                    fondo.execute(() -> {
+                        String e = qrz.probar();
+                        ui.post(() -> Toast.makeText(this, e == null ? "QRZ.com: cuenta correcta" : "QRZ.com: " + e, Toast.LENGTH_LONG).show());
+                    });
+                })
+                .setNegativeButton("Cancelar", null).show();
+    }
+
+    /** Conectar el móvil a la cuenta de Bitácora 26: indicativo + contraseña, y luego el código que llega al correo. */
+    private void conectarCuenta() {
+        EditText ind = campo("Indicativo (o correo) de tu cuenta", false, 16);
+        ind.setFilters(new InputFilter[0]);
+        ind.setText(operador());
+        EditText clave = campoClave("Contraseña de Bitácora 26");
+        TextView nota = texto("Es la cuenta que usas en el programa del PC. Tu PC tiene que tener activado «Sincronizar mis ordenadores».", 12, Color.GRAY, false);
+        new AlertDialog.Builder(this).setTitle("Conectar con el PC").setView(caja(ind, clave, nota))
+                .setPositiveButton("Siguiente", (d, w) -> {
+                    String quien = ind.getText().toString().trim(), c = clave.getText().toString();
+                    if (quien.isEmpty() || c.isEmpty()) return;
+                    fondo.execute(() -> {
+                        try {
+                            String correo = nube.vincular(quien, c);
+                            ui.post(() -> pedirCodigo(quien, correo));
+                        } catch (Exception e) {
+                            ui.post(() -> Toast.makeText(this, e.getMessage(), Toast.LENGTH_LONG).show());
+                        }
+                    });
+                })
+                .setNegativeButton("Cancelar", null).show();
+    }
+
+    private void pedirCodigo(String quien, String correo) {
+        EditText cod = campo("Código", true, 20);
+        new AlertDialog.Builder(this).setTitle("Código del correo")
+                .setMessage("Te hemos mandado un código a " + correo + ". Escríbelo aquí.")
+                .setView(caja(cod)).setCancelable(false)
+                .setPositiveButton("Conectar", (d, w) -> {
+                    String c = cod.getText().toString().trim();
+                    fondo.execute(() -> {
+                        try {
+                            String ind = nube.vincularCodigo(quien, c);
+                            ui.post(() -> {
+                                if (!ind.isEmpty() && !ind.equals(operador())) prefs.edit().putString("operador", ind).apply();
+                                subirLoQueYaHabia();
+                                new AlertDialog.Builder(this).setTitle("Móvil conectado")
+                                        .setMessage("Listo. Abre Bitácora 26 en tu PC (o pulsa Sincronizar allí) para que te mande tu LOG. "
+                                                + "A partir de ahora, lo que apuntes aquí llegará al PC y al revés.")
+                                        .setPositiveButton("Vale", null).show();
+                                sincronizar(false);
+                            });
+                        } catch (Exception e) {
+                            ui.post(() -> Toast.makeText(this, e.getMessage(), Toast.LENGTH_LONG).show());
+                        }
+                    });
+                })
+                .setNegativeButton("Cancelar", null).show();
+    }
+
+    /** Lo apuntado en el móvil antes de conectar también va al PC. */
+    private void subirLoQueYaHabia() {
+        for (Db.Actividad a : db.actividades()) if (a.uuid != null && !a.uuid.isEmpty()) nube.encolarActividad(a.uuid, a.nombre, operador());
+        for (Db.Qso q : db.todos()) nube.encolarQso(q, q.uuid, operador());
+    }
+
+    private void desconectarCuenta() {
+        new AlertDialog.Builder(this).setTitle("Desconectar")
+                .setMessage("El móvil dejará de sincronizar con tu PC. Tus contactos se quedan en el móvil.")
+                .setPositiveButton("Desconectar", (d, w) -> { nube.desconectar(); mostrar(pantalla); })
+                .setNegativeButton("Cancelar", null).show();
     }
 
     private void exportarAdi() {
