@@ -97,8 +97,33 @@ public class MainActivity extends Activity {
         sincronizar(false);
     }
 
+    /** Recuento anónimo de programas abiertos: mientras la app está en pantalla, cada 4 minutos "sigo abierta". */
+    private final Runnable latido = new Runnable() {
+        @Override public void run() {
+            String id = prefs.getString("latido", "");
+            if (!id.matches("[0-9a-f]{32}")) { id = Db.nuevoUuid(); prefs.edit().putString("latido", id).apply(); }
+            String fid = id;
+            fondo.execute(() -> {
+                try {
+                    org.json.JSONObject p = new org.json.JSONObject();
+                    p.put("i", fid);
+                    p.put("p", "MOVIL");
+                    Nube.post("/latido", p);
+                } catch (Exception ignored) { }
+            });
+            ui.postDelayed(this, 240_000);
+        }
+    };
+
+    @Override protected void onPause() {
+        super.onPause();
+        ui.removeCallbacks(latido);
+    }
+
     @Override protected void onResume() {
         super.onResume();
+        ui.removeCallbacks(latido);
+        ui.post(latido);
         if (nube != null && nube.conectada() && System.currentTimeMillis() - prefs.getLong("ultimaSync", 0) > 60_000) sincronizar(false);
     }
 
