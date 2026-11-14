@@ -1,0 +1,42 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'es.bitacora26.movil'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'es.bitacora26.movil'
+        minSdk 24
+        targetSdk 34
+        versionCode 1
+        versionName '0.1'
+    }
+
+    signingConfigs {
+        bitacora {
+            // La llave de firma la pone GitHub (secretos del repositorio); así cada versión se instala encima de la anterior
+            storeFile file(System.getenv('FIRMA_FICHERO') ?: 'no-existe.jks')
+            storePassword System.getenv('FIRMA_CLAVE') ?: ''
+            keyAlias 'bitacora26'
+            keyPassword System.getenv('FIRMA_CLAVE') ?: ''
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig System.getenv('FIRMA_FICHERO') ? signingConfigs.bitacora : signingConfigs.debug
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    implementation 'androidx.core:core:1.13.1'
+}
